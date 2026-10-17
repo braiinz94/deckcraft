@@ -1,10 +1,12 @@
-//! Mutation fuzzing of the hand-written video decoders (AV1, VP9, HEVC) at the bitstream level.
+//! Mutation fuzzing of the hand-written decoders (AV1, VP9, HEVC, H.264 video; Opus audio) at the
+//! bitstream level.
 //!
 //! `damaged_media_neither_panics_nor_hangs` (decode.rs) damages whole files, so most mutations land
-//! in the container and never reach a decoder. Here the clips are demuxed the way `video.rs` does,
-//! and the compressed samples themselves are damaged (truncated, bit-flipped, overwritten, dropped,
-//! repeated, reordered) before they reach the decoder. Every mutation must give an error or
-//! pictures: never a panic, never a hang (AGENTS.md: never crash).
+//! in the container and never reach a decoder. Here the clips are demuxed the way `video.rs` and
+//! `audio.rs` do, and the compressed samples themselves are damaged (truncated, bit-flipped,
+//! overwritten, dropped, repeated, reordered) before they reach the decoder. Every mutation must
+//! give an error or output: never a panic, never a hang (AGENTS.md: never crash). An Opus packet
+//! truncated to nothing is fed as a lost packet (`decode(None)`), so concealment is fuzzed too.
 //!
 //! The AV1 film grain clips (`clip-av1-grain-*.mkv`) are there so the mutations reach the grain
 //! synthesis too; `av1_grain_fixtures_carry_film_grain` checks they really carry grain.
@@ -21,7 +23,8 @@ use std::time::Duration;
 use deckcraft_isobmff::{CodecConfig, TrackKind as Mp4Kind};
 use deckcraft_matroska::{Codec as MkvCodec, TrackKind as MkvKind};
 
-/// How long one decode of a ~5-frame 64×48 clip may take before it counts as a hang.
+/// How long one decode of a fixture (a ~6-frame 64×48 clip, half a second of audio) may take
+/// before it counts as a hang.
 const HANG: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug)]
@@ -29,9 +32,12 @@ enum Kind {
     Av1,
     Vp9,
     Hevc,
+    H264,
+    Opus,
 }
 
-/// A demuxed clip: codec, its configuration record (av1C config OBUs or hvcC) and the samples.
+/// A demuxed clip: codec, its configuration record (av1C config OBUs, hvcC, avcC or OpusHead)
+/// and the samples.
 #[derive(Clone)]
 struct Clip {
     name: String,
@@ -64,16 +70,46 @@ fn demux_mp4(name: &str) -> Clip {
     let f = deckcraft_isobmff::open(&bytes).expect("mp4");
     let ti = f.track_of_kind(Mp4Kind::Video).expect("video track");
     let t = &f.tracks[ti];
-    let config = match &t.entries.first().expect("sample entry").codec {
-        CodecConfig::Hevc(c) => c.to_bytes(),
-        _ => panic!("{name}: expected HEVC"),
+    let (kind, config) = match &t.entries.first().expect("sample entry").codec {
+        CodecConfig::Hevc(c) => (Kind::Hevc, c.to_bytes()),
+        CodecConfig::Avc(c) => (Kind::H264, c.to_bytes()),
+        _ => panic!("{name}: expected HEVC or H.264"),
     };
     let samples = (0..t.samples.len()).map(|i| f.read_sample(&bytes, ti, i).expect("sample")).collect();
-    Clip { name: name.to_string(), kind: Kind::Hevc, config, samples }
+    Clip { name: name.to_string(), kind, config, samples }
 }
 
-/// Decodes a clip the way `video.rs` drives each decoder; returns the number of pictures.
-/// Decoder errors are fine (damaged input); only panics and hangs are failures.
+/// The Opus stream of an Ogg file, read the way `audio.rs` reads it.
+fn demux_ogg_opus(name: &str) -> Clip {
+    let bytes = fixture(name);
+    let src: &[u8] = &bytes;
+    let f = deckcraft_ogg::open(src).expect("ogg");
+    let s = f.stream_of(deckcraft_ogg::Codec::Opus).expect("opus stream");
+    let config = f.streams[s].headers.first().expect("OpusHead").clone();
+    let samples = (0..f.streams[s].packets.len()).map(|i| f.read_packet(src, s, i).expect("packet")).collect();
+    Clip { name: name.to_string(), kind: Kind::Opus, config, samples }
+}
+
+/// The Opus track of a WebM file.
+fn demux_mkv_opus(name: &str) -> Clip {
+    let bytes = fixture(name);
+    let f = deckcraft_matroska::open(&bytes).expect("matroska");
+    let (ti, head) = f
+        .tracks
+        .iter()
+        .enumerate()
+        .find_map(|(i, t)| match &t.codec {
+            MkvCodec::Opus { head } => Some((i, head.clone())),
+            _ => None,
+        })
+        .expect("opus track");
+    let samples = (0..f.tracks[ti].samples.len()).map(|i| f.read_sample(&bytes, ti, i).expect("sample")).collect();
+    Clip { name: format!("{name} (Opus)"), kind: Kind::Opus, config: head, samples }
+}
+
+/// Decodes a clip the way `video.rs` and `audio.rs` drive each decoder; returns the number of
+/// pictures (or, for Opus, of packets that gave audio). Decoder errors are fine (damaged input);
+/// only panics and hangs are failures.
 fn decode(clip: &Clip) -> usize {
     let mut pictures = 0;
     match clip.kind {
@@ -100,6 +136,24 @@ fn decode(clip: &Clip) -> usize {
                 pictures += d.decode(s, i as i64).map(|p| p.len()).unwrap_or(0);
             }
             pictures += d.flush().len();
+        }
+        Kind::H264 => {
+            let Ok(mut d) = deckcraft_h264::Decoder::from_avcc(&clip.config) else { return 0 };
+            for (i, s) in clip.samples.iter().enumerate() {
+                pictures += d.decode(s, i as i64).map(|p| p.len()).unwrap_or(0);
+            }
+            pictures += d.flush().len();
+        }
+        Kind::Opus => {
+            let Ok(mut d) = deckcraft_opus::Decoder::new(&clip.config) else { return 0 };
+            d.set_trim_pre_skip(true);
+            for s in &clip.samples {
+                // An empty packet stands for a lost one: concealment runs instead of decoding.
+                let packet = (!s.is_empty()).then_some(s.as_slice());
+                if d.decode(packet).is_ok_and(|planes| planes.iter().any(|p| !p.is_empty())) {
+                    pictures += 1;
+                }
+            }
         }
     }
     pictures
@@ -263,7 +317,7 @@ fn env_u64(name: &str, default: u64) -> u64 {
 }
 
 #[test]
-fn damaged_video_bitstreams_neither_panic_nor_hang() {
+fn damaged_bitstreams_neither_panic_nor_hang() {
     let _serial = HOOK.lock().unwrap_or_else(|e| e.into_inner());
     let last_panic = record_panics();
     let iters = env_u64("DECKCRAFT_MUTATION_ITERS", 200);
@@ -276,6 +330,10 @@ fn damaged_video_bitstreams_neither_panic_nor_hang() {
         demux_mkv("clip-av1-grain-15.mkv"),
         demux_mkv("clip-vp9.webm"),
         demux_mp4("clip-hevc.mp4"),
+        demux_mp4("clip-h264.mp4"),
+        demux_mp4("clip-h264.mov"),
+        demux_ogg_opus("tone.opus"),
+        demux_mkv_opus("clip-vp9.webm"),
     ];
     let mut failures = Vec::new();
 
