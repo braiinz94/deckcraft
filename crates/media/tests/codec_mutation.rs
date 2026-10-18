@@ -393,12 +393,16 @@ fn panic_hook_forwards_to_the_previous_hook() {
 fn damaged_bitstreams_neither_panic_nor_hang() {
     let _serial = HOOK.lock().unwrap_or_else(|e| e.into_inner());
     let last_panic = record_panics();
-    let iters = env_u64("DECKCRAFT_MUTATION_ITERS", 200);
-    let seed0 = env_u64("DECKCRAFT_MUTATION_SEED", 0x00de_c0de);
-    // Replaying one failure: start at its iteration, on its clip only (see `replay_command`).
-    let from = env_u64("DECKCRAFT_MUTATION_FROM", 0);
     let only = std::env::var("DECKCRAFT_MUTATION_CLIP").ok();
-    let clips = [
+    let run = Run {
+        seed0: env_u64("DECKCRAFT_MUTATION_SEED", 0x00de_c0de),
+        // Replaying one failure: start at its iteration, on its clip only (see `replay_command`).
+        from: env_u64("DECKCRAFT_MUTATION_FROM", 0),
+        iters: env_u64("DECKCRAFT_MUTATION_ITERS", 200),
+        only: only.as_deref(),
+        limit: HANG,
+    };
+    let clips = vec![
         demux_mkv("clip-av1.mkv"),
         // Film grain synthesis (crates/av1/src/grain.rs) only runs on streams that carry grain.
         demux_mkv("clip-av1-grain-4.mkv"),
@@ -411,27 +415,96 @@ fn damaged_bitstreams_neither_panic_nor_hang() {
         demux_ogg_opus("tone.opus"),
         demux_mkv_opus("clip-vp9.webm"),
     ];
-    let mut failures = Vec::new();
+    let failures = fuzz(clips, &run, decode, &last_panic);
+    let _ = panic::take_hook();
+    assert!(failures.is_empty(), "{} damaged bitstreams panicked or hung:\n{}", failures.len(), failures.join("\n"));
+}
 
+/// What one fuzzing run is asked to do.
+struct Run<'a> {
+    seed0: u64,
+    from: u64,
+    iters: u64,
+    /// Only the clip with this name (`DECKCRAFT_MUTATION_CLIP`).
+    only: Option<&'a str>,
+    /// How long one decode may take before it counts as a hang.
+    limit: Duration,
+}
+
+/// Fuzzes `clips` through `work` (the decoder driver) and returns the failures.
+///
+/// A clip filter that matches no clip is an error: a mistyped replay must not pass while
+/// decoding nothing. The run stops at the first hang: the hung thread keeps running, so going on
+/// would slow every later decode and could pile up more hangs before the report.
+fn fuzz(clips: Vec<Clip>, run: &Run, work: fn(&Clip) -> usize, last_panic: &Arc<Mutex<String>>) -> Vec<String> {
+    if let Some(name) = run.only {
+        let names: Vec<&str> = clips.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&name), "DECKCRAFT_MUTATION_CLIP={name:?} matches no clip; the clips are: {}", names.join(", "));
+    }
+    let mut failures = Vec::new();
     // The clip's index is part of every seed, so it is taken before any filtering.
-    for (ci, clip) in clips.into_iter().enumerate() {
-        if only.as_deref().is_some_and(|name| name != clip.name) {
+    'clips: for (ci, clip) in clips.into_iter().enumerate() {
+        if run.only.is_some_and(|name| name != clip.name) {
             continue;
         }
         // Control: the clean clip must decode to pictures, or the harness tests nothing.
         let c = clip.clone();
-        let clean = run_guarded(move || decode(&c), HANG, &last_panic).unwrap_or_else(|e| panic!("{} clean clip: {e}", clip.name));
+        let clean = run_guarded(move || work(&c), run.limit, last_panic).unwrap_or_else(|e| panic!("{} clean clip: {e}", clip.name));
         assert!(clean > 0, "{}: the clean clip decoded to no pictures, the harness is broken", clip.name);
 
-        for i in from..from.saturating_add(iters) {
-            let (damaged, mutations) = damaged_copy(&clip, seed0, ci, i);
-            if let Err(e) = run_guarded(move || decode(&damaged), HANG, &last_panic) {
-                failures.push(format!("{} iter={i}: {} -> {e}\n  replay: {}", clip.name, mutations.join("; "), replay_command(seed0, &clip.name, i)));
+        for i in run.from..run.from.saturating_add(run.iters) {
+            let (damaged, mutations) = damaged_copy(&clip, run.seed0, ci, i);
+            if let Err(e) = run_guarded(move || work(&damaged), run.limit, last_panic) {
+                let hung = e.starts_with("hang:");
+                failures.push(format!(
+                    "{} iter={i}: {} -> {e}\n  replay: {}",
+                    clip.name,
+                    mutations.join("; "),
+                    replay_command(run.seed0, &clip.name, i)
+                ));
+                if hung {
+                    failures.push("stopped at the first hang: its thread is still running".to_string());
+                    break 'clips;
+                }
             }
         }
-        eprintln!("{}: {} clean pictures, {iters} mutations done", clip.name, clean);
+        eprintln!("{}: {} clean pictures, {} mutations done", clip.name, clean, run.iters);
     }
+    failures
+}
 
-    let _ = panic::take_hook();
-    assert!(failures.is_empty(), "{} damaged bitstreams panicked or hung:\n{}", failures.len(), failures.join("\n"));
+/// A clip filter with a typo is an error, not a run that decodes nothing and passes.
+#[test]
+fn clip_filter_that_matches_no_clip_is_an_error() {
+    let _serial = HOOK.lock().unwrap_or_else(|e| e.into_inner());
+    let last_panic = Arc::new(Mutex::new(String::new()));
+    let run = Run { seed0: 1, from: 0, iters: 1, only: Some("clip-hevc.mp44"), limit: HANG };
+    let result = panic::catch_unwind(AssertUnwindSafe(|| fuzz(vec![demux_mp4("clip-hevc.mp4")], &run, decode, &last_panic)));
+    assert!(result.is_err(), "a filter that matches no clip passed: {result:?}");
+}
+
+static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Decodes once (the clean-clip control), then hangs on every later call.
+fn hang_after_the_first_call(_: &Clip) -> usize {
+    if CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+        return 1;
+    }
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The first hang ends the whole run: no more mutations of that clip, no later clip.
+#[test]
+fn fuzzing_stops_at_the_first_hang() {
+    let _serial = HOOK.lock().unwrap_or_else(|e| e.into_inner());
+    let last_panic = Arc::new(Mutex::new(String::new()));
+    let mut second = demux_mp4("clip-hevc.mp4");
+    second.name = "second clip".to_string();
+    let run = Run { seed0: 1, from: 0, iters: 5, only: None, limit: Duration::from_millis(200) };
+    let failures = fuzz(vec![demux_mp4("clip-hevc.mp4"), second], &run, hang_after_the_first_call, &last_panic);
+    assert_eq!(failures.len(), 2, "{failures:#?}");
+    assert!(failures[0].contains("hang:") && failures[1].starts_with("stopped at the first hang"), "{failures:#?}");
+    assert_eq!(CALLS.load(std::sync::atomic::Ordering::SeqCst), 2, "the run went on after the first hang");
 }
