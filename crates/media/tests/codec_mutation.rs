@@ -11,9 +11,11 @@
 //! The AV1 film grain clips (`clip-av1-grain-*.mkv`) are there so the mutations reach the grain
 //! synthesis too; `av1_grain_fixtures_carry_film_grain` checks they really carry grain.
 //!
-//! Seeded and deterministic. `DECKCRAFT_MUTATION_ITERS` (default 200 per codec) runs it longer;
-//! `DECKCRAFT_MUTATION_SEED` replays from another seed. A failure prints codec, seed, iteration and
-//! mutation so it can be replayed and turned into a fixture.
+//! Seeded and deterministic. `DECKCRAFT_MUTATION_ITERS` (default 200 per clip) runs it longer;
+//! `DECKCRAFT_MUTATION_SEED` (decimal or `0x` hex) starts from another seed. A failure prints the
+//! clip, iteration and mutation, and a command that replays it on its own
+//! (`DECKCRAFT_MUTATION_CLIP` and `DECKCRAFT_MUTATION_FROM` select the clip and iteration), so it
+//! can be turned into a fixture.
 
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::mpsc;
@@ -241,13 +243,17 @@ fn run_guarded(work: impl FnOnce() -> usize + Send + 'static, limit: Duration, l
     }
 }
 
-/// The panic hook is process-wide: the two tests below take this lock so they never share it.
+/// The panic hook is process-wide: every test in this file takes this lock, so none of them runs
+/// while another one's hook is installed.
 static HOOK: Mutex<()> = Mutex::new(());
 
-/// Installs a hook that records where the last panic happened (the payload alone lacks it).
+/// Installs a hook that records where the last panic happened (the payload alone lacks it), then
+/// hands the panic to the hook that was there before, so a failing assertion still prints its
+/// message.
 fn record_panics() -> Arc<Mutex<String>> {
     let last_panic = Arc::new(Mutex::new(String::new()));
     let sink = Arc::clone(&last_panic);
+    let previous = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
         let msg = info
             .payload()
@@ -259,6 +265,7 @@ fn record_panics() -> Arc<Mutex<String>> {
         if let Ok(mut s) = sink.lock() {
             *s = format!("{msg} at {at}");
         }
+        previous(info);
     }));
     last_panic
 }
@@ -267,6 +274,7 @@ fn record_panics() -> Arc<Mutex<String>> {
 /// the sequence header says so, and decoding with grain changes the pictures.
 #[test]
 fn av1_grain_fixtures_carry_film_grain() {
+    let _serial = HOOK.lock().unwrap_or_else(|e| e.into_inner());
     for name in ["clip-av1-grain-4.mkv", "clip-av1-grain-6.mkv", "clip-av1-grain-15.mkv"] {
         let clip = demux_mkv(name);
         let pictures = |grain: bool| {
@@ -312,8 +320,73 @@ fn harness_reports_panics_and_hangs() {
     let _ = panic::take_hook();
 }
 
+/// A number in decimal or, with a `0x` prefix, in hexadecimal.
+fn parse_u64(v: &str) -> Option<u64> {
+    let v = v.trim();
+    match v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(&hex.replace('_', ""), 16).ok(),
+        None => v.replace('_', "").parse().ok(),
+    }
+}
+
+/// Reads a number from the environment. A value that does not parse is an error, not the
+/// default: a mistyped replay seed must not silently run the default mutations.
 fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    match std::env::var(name) {
+        Ok(v) => parse_u64(&v).unwrap_or_else(|| panic!("{name}={v:?} is not a number (decimal or 0x hex)")),
+        Err(_) => default,
+    }
+}
+
+/// The damaged copy of clip number `ci` for iteration `i` of a run started from `seed0`, and the
+/// mutations that made it. Deterministic: the same three numbers always give the same copy.
+fn damaged_copy(clip: &Clip, seed0: u64, ci: usize, i: u64) -> (Clip, Vec<String>) {
+    let seed = seed0 ^ (i.wrapping_mul(0x9e37_79b9_7f4a_7c15)) ^ (ci as u64) << 56;
+    let mut rng = Rng(seed | 1);
+    let mut damaged = clip.clone();
+    let steps = 1 + rng.below(3);
+    let mutations = (0..steps).map(|_| mutate(&mut damaged, &mut rng)).collect();
+    (damaged, mutations)
+}
+
+/// The command that replays one failing mutation on its own.
+fn replay_command(seed0: u64, clip: &str, i: u64) -> String {
+    format!(
+        "DECKCRAFT_MUTATION_SEED={seed0:#x} DECKCRAFT_MUTATION_CLIP='{clip}' DECKCRAFT_MUTATION_FROM={i} DECKCRAFT_MUTATION_ITERS=1 \
+         cargo test -p deckcraft-media --test codec_mutation damaged_bitstreams"
+    )
+}
+
+/// The replay command really replays: its numbers parse back (hex included), and the same seed,
+/// clip and iteration give the same damaged copy.
+#[test]
+fn reported_failures_replay_exactly() {
+    let _serial = HOOK.lock().unwrap_or_else(|e| e.into_inner());
+    assert_eq!(parse_u64("0x00de_c0de"), Some(0xdec0de));
+    assert_eq!(parse_u64("14598366"), Some(14_598_366));
+    assert_eq!(parse_u64("0xZZ"), None);
+    let cmd = replay_command(0x00de_c0de, "clip-hevc.mp4", 42);
+    let seed = cmd.split_whitespace().find_map(|w| w.strip_prefix("DECKCRAFT_MUTATION_SEED=")).and_then(parse_u64);
+    assert_eq!(seed, Some(0xdec0de), "{cmd}");
+    let clip = demux_mp4("clip-hevc.mp4");
+    let (a, why_a) = damaged_copy(&clip, 0xdec0de, 5, 42);
+    let (b, why_b) = damaged_copy(&clip, 0xdec0de, 5, 42);
+    assert_eq!((a.config, a.samples, why_a), (b.config, b.samples, why_b));
+}
+
+/// The recording hook must hand every panic on to the hook it replaced: otherwise a failing
+/// assert in a test prints no message while it is installed.
+#[test]
+fn panic_hook_forwards_to_the_previous_hook() {
+    let _serial = HOOK.lock().unwrap_or_else(|e| e.into_inner());
+    let forwarded = Arc::new(Mutex::new(0usize));
+    let seen = Arc::clone(&forwarded);
+    panic::set_hook(Box::new(move |_| *seen.lock().unwrap_or_else(|e| e.into_inner()) += 1));
+    let last_panic = record_panics();
+    let crashed = run_guarded(|| panic!("forwarded control panic"), Duration::from_secs(5), &last_panic);
+    let _ = panic::take_hook();
+    assert!(crashed.as_ref().is_err_and(|e| e.contains("forwarded control panic")), "{crashed:?}");
+    assert_eq!(*forwarded.lock().unwrap_or_else(|e| e.into_inner()), 1, "the previous hook did not see the panic");
 }
 
 #[test]
@@ -322,6 +395,9 @@ fn damaged_bitstreams_neither_panic_nor_hang() {
     let last_panic = record_panics();
     let iters = env_u64("DECKCRAFT_MUTATION_ITERS", 200);
     let seed0 = env_u64("DECKCRAFT_MUTATION_SEED", 0x00de_c0de);
+    // Replaying one failure: start at its iteration, on its clip only (see `replay_command`).
+    let from = env_u64("DECKCRAFT_MUTATION_FROM", 0);
+    let only = std::env::var("DECKCRAFT_MUTATION_CLIP").ok();
     let clips = [
         demux_mkv("clip-av1.mkv"),
         // Film grain synthesis (crates/av1/src/grain.rs) only runs on streams that carry grain.
@@ -337,20 +413,20 @@ fn damaged_bitstreams_neither_panic_nor_hang() {
     ];
     let mut failures = Vec::new();
 
+    // The clip's index is part of every seed, so it is taken before any filtering.
     for (ci, clip) in clips.into_iter().enumerate() {
+        if only.as_deref().is_some_and(|name| name != clip.name) {
+            continue;
+        }
         // Control: the clean clip must decode to pictures, or the harness tests nothing.
         let c = clip.clone();
         let clean = run_guarded(move || decode(&c), HANG, &last_panic).unwrap_or_else(|e| panic!("{} clean clip: {e}", clip.name));
         assert!(clean > 0, "{}: the clean clip decoded to no pictures, the harness is broken", clip.name);
 
-        for i in 0..iters {
-            let seed = seed0 ^ (i.wrapping_mul(0x9e37_79b9_7f4a_7c15)) ^ (ci as u64) << 56;
-            let mut rng = Rng(seed | 1);
-            let mut damaged = clip.clone();
-            let steps = 1 + rng.below(3);
-            let mutations: Vec<String> = (0..steps).map(|_| mutate(&mut damaged, &mut rng)).collect();
+        for i in from..from.saturating_add(iters) {
+            let (damaged, mutations) = damaged_copy(&clip, seed0, ci, i);
             if let Err(e) = run_guarded(move || decode(&damaged), HANG, &last_panic) {
-                failures.push(format!("{} seed={seed:#x} iter={i}: {} -> {e}", clip.name, mutations.join("; ")));
+                failures.push(format!("{} iter={i}: {} -> {e}\n  replay: {}", clip.name, mutations.join("; "), replay_command(seed0, &clip.name, i)));
             }
         }
         eprintln!("{}: {} clean pictures, {iters} mutations done", clip.name, clean);
